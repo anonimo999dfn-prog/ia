@@ -1,0 +1,318 @@
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Configuração das APIs disponíveis
+const APIs = {
+  groq: {
+    name: 'Groq',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    key: process.env.GROQ_API_KEY,
+    model: 'mixtral-8x7b-32768',
+    maxTokens: 32000,
+    cost: 0.00001,
+    available: true
+  },
+  gemini: {
+    name: 'Gemini',
+    url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    key: process.env.GEMINI_API_KEY,
+    model: 'gemini-2.0-flash-exp',
+    maxTokens: 100000,
+    cost: 0.00001,
+    available: true
+  },
+  deepseek: {
+    name: 'DeepSeek',
+    url: 'https://api.deepseek.com/chat/completions',
+    key: process.env.DEEPSEEK_API_KEY,
+    model: 'deepseek-chat',
+    maxTokens: 4000,
+    cost: 0.0000015,
+    available: true
+  },
+  mistral: {
+    name: 'Mistral',
+    url: 'https://api.mistral.ai/v1/chat/completions',
+    key: process.env.MISTRAL_API_KEY,
+    model: 'mistral-small-latest',
+    maxTokens: 32000,
+    cost: 0.0000014,
+    available: true
+  },
+  openrouter: {
+    name: 'OpenRouter',
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    key: process.env.OPENROUTER_API_KEY,
+    model: 'auto',
+    maxTokens: 4000,
+    cost: 0.000002,
+    available: true
+  }
+};
+
+// Sistema de métricas
+const metrics = {
+  requests: 0,
+  totalCost: 0,
+  apiUsage: {},
+  errors: 0,
+  avgLatency: 0
+};
+
+// Histórico de requisições (simples)
+const requestHistory = [];
+
+// ==================== ROTEADOR INTELIGENTE ====================
+class SmartRouter {
+  constructor() {
+    this.apiScores = {};
+    this.initScores();
+  }
+
+  initScores() {
+    Object.keys(APIs).forEach(api => {
+      this.apiScores[api] = {
+        uptime: 1.0,
+        avgLatency: 500,
+        successRate: 1.0,
+        reputation: 1.0
+      };
+    });
+  }
+
+  // Seleciona melhor API baseado em critérios
+  selectBestAPI(messageLength, isCode = false) {
+    const available = Object.entries(APIs).filter(([_, api]) => api.available && api.key);
+    
+    if (available.length === 0) {
+      throw new Error('Nenhuma API disponível');
+    }
+
+    // Se é código, DeepSeek é melhor
+    if (isCode) {
+      const deepseek = available.find(([key]) => key === 'deepseek');
+      if (deepseek) return deepseek[0];
+    }
+
+    // Se mensagem curta, usa API rápida
+    if (messageLength < 100) {
+      const groq = available.find(([key]) => key === 'groq');
+      if (groq) return groq[0];
+    }
+
+    // Calcula score de cada API
+    const scores = available.map(([key, api]) => {
+      const score = {
+        api: key,
+        score: 
+          (this.apiScores[key].successRate * 0.4) +
+          (this.apiScores[key].reputation * 0.3) +
+          ((1000 / (this.apiScores[key].avgLatency || 500)) * 0.3)
+      };
+      return score;
+    });
+
+    return scores.sort((a, b) => b.score - a.score)[0].api;
+  }
+
+  // Fallback em cascata
+  async tryWithFallback(selectedAPI, payload, retryCount = 0) {
+    const maxRetries = 3;
+    const availableAPIs = Object.keys(APIs).filter(api => APIs[api].key);
+
+    try {
+      const result = await this.callAPI(selectedAPI, payload);
+      this.recordSuccess(selectedAPI);
+      return { api: selectedAPI, response: result };
+    } catch (error) {
+      console.log(`❌ ${selectedAPI} falhou:`, error.message);
+      
+      if (retryCount >= maxRetries) {
+        throw new Error('Todas as APIs falharam');
+      }
+
+      // Tenta próxima API
+      const nextAPI = availableAPIs.find(api => api !== selectedAPI);
+      if (!nextAPI) throw error;
+
+      console.log(`🔄 Tentando fallback: ${nextAPI}`);
+      return this.tryWithFallback(nextAPI, payload, retryCount + 1);
+    }
+  }
+
+  async callAPI(apiKey, payload) {
+    const api = APIs[apiKey];
+    const startTime = Date.now();
+
+    const config = {
+      headers: {
+        'Authorization': `Bearer ${api.key}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    };
+
+    // Ajusta payload conforme a API
+    let adjustedPayload = { ...payload };
+    adjustedPayload.model = api.model;
+
+    try {
+      const response = await axios.post(api.url, adjustedPayload, config);
+      const latency = Date.now() - startTime;
+      this.recordLatency(apiKey, latency);
+      
+      return {
+        text: response.data.choices[0].message.content,
+        tokens: response.data.usage.completion_tokens,
+        model: api.model,
+        latency
+      };
+    } catch (error) {
+      this.recordError(apiKey);
+      throw error;
+    }
+  }
+
+  recordSuccess(apiKey) {
+    this.apiScores[apiKey].successRate = Math.min(1.0, this.apiScores[apiKey].successRate + 0.01);
+    this.apiScores[apiKey].reputation = Math.min(1.0, this.apiScores[apiKey].reputation + 0.02);
+  }
+
+  recordError(apiKey) {
+    this.apiScores[apiKey].successRate *= 0.95;
+    this.apiScores[apiKey].reputation *= 0.9;
+  }
+
+  recordLatency(apiKey, latency) {
+    const current = this.apiScores[apiKey].avgLatency;
+    this.apiScores[apiKey].avgLatency = (current * 0.7) + (latency * 0.3);
+  }
+}
+
+const router = new SmartRouter();
+
+// ==================== ENDPOINTS ====================
+
+// POST /chat - Envia mensagem
+app.post('/chat', async (req, res) => {
+  try {
+    const { message, history = [] } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ error: 'Mensagem vazia' });
+    }
+
+    // Monta payload
+    const messages = [
+      ...history.map(msg => ({
+        role: msg.role,
+        content: msg.content
+      })),
+      { role: 'user', content: message }
+    ];
+
+    const payload = {
+      messages,
+      max_tokens: 1000,
+      temperature: 0.7
+    };
+
+    // Detecta tipo de tarefa
+    const isCode = message.includes('code') || message.includes('função') || message.includes('erro');
+    
+    // Seleciona melhor API
+    const selectedAPI = router.selectBestAPI(message.length, isCode);
+    console.log(`📡 Usando API: ${selectedAPI}`);
+
+    // Chama com fallback
+    const { api, response } = await router.tryWithFallback(selectedAPI, payload);
+
+    // Registra métricas
+    metrics.requests++;
+    metrics.apiUsage[api] = (metrics.apiUsage[api] || 0) + 1;
+    metrics.totalCost += response.tokens * APIs[api].cost;
+
+    requestHistory.push({
+      timestamp: new Date(),
+      api,
+      message,
+      tokens: response.tokens
+    });
+
+    res.json({
+      response: response.text,
+      api,
+      model: response.model,
+      latency: response.latency,
+      tokens: response.tokens
+    });
+
+  } catch (error) {
+    metrics.errors++;
+    console.error('Erro:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /health - Status das APIs
+app.get('/health', (req, res) => {
+  const status = {};
+  
+  Object.entries(APIs).forEach(([key, api]) => {
+    status[key] = {
+      available: !!api.key,
+      name: api.name,
+      model: api.model,
+      score: router.apiScores[key]
+    };
+  });
+
+  res.json({ 
+    status,
+    metrics: {
+      totalRequests: metrics.requests,
+      totalCost: metrics.totalCost.toFixed(4),
+      apiUsage: metrics.apiUsage,
+      errors: metrics.errors
+    }
+  });
+});
+
+// GET /models - Lista de modelos disponíveis
+app.get('/models', (req, res) => {
+  const models = Object.entries(APIs).map(([key, api]) => ({
+    id: key,
+    name: `${api.name} (${api.model})`,
+    maxTokens: api.maxTokens,
+    costPerToken: api.cost,
+    available: !!api.key
+  }));
+
+  res.json({ models });
+});
+
+// ==================== SERVER ====================
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════╗
+║  🤖 AI Router Backend Iniciado        ║
+║  Porta: ${PORT}                           ║
+║  Ambiente: ${process.env.NODE_ENV || 'development'}     ║
+╚════════════════════════════════════════╝
+  `);
+  
+  console.log('\n📡 APIs configuradas:');
+  Object.entries(APIs).forEach(([key, api]) => {
+    const status = api.key ? '✅' : '❌';
+    console.log(`  ${status} ${api.name} - ${api.model}`);
+  });
+});
+
+module.exports = app;
